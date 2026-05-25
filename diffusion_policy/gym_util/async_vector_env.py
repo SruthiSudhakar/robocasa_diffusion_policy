@@ -186,7 +186,9 @@ class AsyncVectorEnv(VectorEnv):
         _, successes = zip(*[pipe.recv() for pipe in self.parent_pipes])
         self._raise_if_errors(successes)
 
-    def reset_async(self):
+    def reset_async(self, seed=None, options=None):
+        # gym>=0.26's VectorEnv.reset() passes seed/options down to reset_async;
+        # accepted and ignored here (seeding is done via .seed() + the init_fn).
         self._assert_is_running()
         if self._state != AsyncState.DEFAULT:
             raise AlreadyPendingCallError(
@@ -199,7 +201,7 @@ class AsyncVectorEnv(VectorEnv):
             pipe.send(("reset", None))
         self._state = AsyncState.WAITING_RESET
 
-    def reset_wait(self, timeout=None):
+    def reset_wait(self, timeout=None, seed=None, options=None):
         """
         Parameters
         ----------
@@ -231,7 +233,7 @@ class AsyncVectorEnv(VectorEnv):
 
         if not self.shared_memory:
             self.observations = concatenate(
-                results, self.observations, self.single_observation_space
+                self.single_observation_space, results, self.observations
             )
 
         return deepcopy(self.observations) if self.copy else self.observations
@@ -294,7 +296,7 @@ class AsyncVectorEnv(VectorEnv):
 
         if not self.shared_memory:
             self.observations = concatenate(
-                observations_list, self.observations, self.single_observation_space
+                self.single_observation_space, observations_list, self.observations
             )
 
         return (

@@ -65,6 +65,9 @@ class RobomimicImageRunner(BaseImageRunner):
             n_obs_steps=2,
             n_action_steps=8,
             render_obs_key='agentview_image',
+            render_width=None,
+            render_height=None,
+            render_camera=None,
             fps=10,
             crf=22,
             past_action=False,
@@ -109,7 +112,10 @@ class RobomimicImageRunner(BaseImageRunner):
                         env=robocasa_env,
                         shape_meta=shape_meta,
                         init_state=None,
-                        render_obs_key=render_obs_key
+                        render_obs_key=render_obs_key,
+                        render_width=render_width,
+                        render_height=render_height,
+                        render_camera=render_camera
                     ),
                     video_recoder=VideoRecorder.create_h264(
                         fps=fps,
@@ -126,7 +132,7 @@ class RobomimicImageRunner(BaseImageRunner):
                 n_action_steps=n_action_steps,
                 max_episode_steps=max_steps
             )
-        
+
         # For each process the OpenGL context can only be initialized once
         # Since AsyncVectorEnv uses fork to create worker process,
         # a separate env_fn that does not create OpenGL context (enable_render=False)
@@ -143,7 +149,10 @@ class RobomimicImageRunner(BaseImageRunner):
                         env=robocasa_env,
                         shape_meta=shape_meta,
                         init_state=None,
-                        render_obs_key=render_obs_key
+                        render_obs_key=render_obs_key,
+                        render_width=render_width,
+                        render_height=render_height,
+                        render_camera=render_camera
                     ),
                     video_recoder=VideoRecorder.create_h264(
                         fps=fps,
@@ -181,8 +190,11 @@ class RobomimicImageRunner(BaseImageRunner):
                 env.env.video_recoder.stop()
                 env.env.file_path = None
                 if enable_render:
+                    # name the video by its (deterministic) env seed instead of a random
+                    # id, so the same rollout lines up by filename across runs with the
+                    # same variables (e.g. media/seed10000.mp4) and is easy to diff.
                     filename = pathlib.Path(output_dir).joinpath(
-                        'media', wv.util.generate_id() + ".mp4")
+                        'media', f"seed{seed}.mp4")
                     filename.parent.mkdir(parents=False, exist_ok=True)
                     filename = str(filename)
                     env.env.file_path = filename
@@ -190,15 +202,42 @@ class RobomimicImageRunner(BaseImageRunner):
                 # switch to seed reset
                 assert isinstance(env.env.env, RobomimicImageWrapper)
                 env.env.env.init_state = None
-                # env.seed(seed)
+                # Pin this rollout's kitchen scene to its (deterministic) seed.
+                # RobomimicImageWrapper.reset() passes this into env.reset(seed=...),
+                # which reseeds only the env's numpy scene RNG -- the policy's torch
+                # noise is untouched, so the same scene plays out with distinct
+                # actions across runs. seed = test_start_seed + rollout_index, so
+                # every rollout gets a distinct, reproducible scene.
+                env.env.env._seed = seed
 
             env_seeds.append(seed)
             env_prefixs.append('test/')
             env_init_fn_dills.append(dill.dumps(init_fn))
 
+        # Padding init fn for partial last chunks. AsyncVectorEnv needs exactly
+        # n_envs init fns, so a short final chunk is padded out to n_envs (see
+        # run()). The padding envs run a throwaway rollout whose results are
+        # sliced away -- but they must NOT write a video. Previously padding
+        # reused env_init_fn_dills[0], whose init_fn points the recorder at
+        # media/seed{test_start_seed}.mp4 with rendering enabled; when a chunk
+        # was short by >=2, multiple worker processes wrote that same file
+        # concurrently and corrupted it (always seed{test_start_seed}, in every
+        # rollout). Disable rendering here so file_path stays None.
+        def pad_init_fn(env, seed=test_start_seed):
+            assert isinstance(env.env, VideoRecordingWrapper)
+            env.env.video_recoder.stop()
+            env.env.file_path = None
+            assert isinstance(env.env.env, RobomimicImageWrapper)
+            env.env.env.init_state = None
+            env.env.env._seed = seed
+        self.pad_init_fn_dill = dill.dumps(pad_init_fn)
+
         env = AsyncVectorEnv(
             env_fns,
             dummy_env_fn=dummy_env_fn,
+            # RoboCasa's observation space is a custom gym.Space, which the
+            # shared-memory path can't batch. Use pipe-based transfer instead.
+            shared_memory=False,
         )
         # env = SyncVectorEnv(env_fns)
 
@@ -208,6 +247,7 @@ class RobomimicImageRunner(BaseImageRunner):
         self.env_prefixs = env_prefixs
         self.env_init_fn_dills = env_init_fn_dills
         self.fps = fps
+        self.robosuite_fps = robosuite_fps
         self.crf = crf
         self.n_obs_steps = n_obs_steps
         self.n_action_steps = n_action_steps
@@ -230,6 +270,8 @@ class RobomimicImageRunner(BaseImageRunner):
         # allocate data
         all_video_paths = [None] * n_inits
         all_rewards = [None] * n_inits
+        # env step at which each rollout first succeeded (None if it never did)
+        all_success_steps = [None] * n_inits
 
         for chunk_idx in range(n_chunks):
             start = chunk_idx * n_envs
@@ -241,7 +283,9 @@ class RobomimicImageRunner(BaseImageRunner):
             this_init_fns = self.env_init_fn_dills[this_global_slice]
             n_diff = n_envs - len(this_init_fns)
             if n_diff > 0:
-                this_init_fns.extend([self.env_init_fn_dills[0]]*n_diff)
+                # Pad with a non-rendering init fn so padding envs never write a
+                # (duplicate, concurrently-corrupted) video. See pad_init_fn.
+                this_init_fns.extend([self.pad_init_fn_dill]*n_diff)
             assert len(this_init_fns) == n_envs
 
             # init envs
@@ -310,6 +354,7 @@ class RobomimicImageRunner(BaseImageRunner):
             # collect data for this round
             all_video_paths[this_global_slice] = env.render()[this_local_slice]
             all_rewards[this_global_slice] = env.call('get_attr', 'reward')[this_local_slice]
+            all_success_steps[this_global_slice] = env.call('get_attr', 'success_step')[this_local_slice]
         # clear out video buffer
         _ = env.reset()
         
@@ -332,6 +377,13 @@ class RobomimicImageRunner(BaseImageRunner):
             max_reward = np.max(all_rewards[i])
             max_rewards[prefix].append(max_reward)
             log_data[prefix+f'sim_max_reward_{seed}'] = max_reward
+
+            # step (and wall-clock time) at which this rollout first succeeded.
+            # None means the task was never completed within the step budget.
+            success_step = all_success_steps[i]
+            log_data[prefix+f'success_step_{seed}'] = success_step
+            log_data[prefix+f'success_time_sec_{seed}'] = (
+                None if success_step is None else success_step / self.robosuite_fps)
 
             # visualize sim
             video_path = all_video_paths[i]

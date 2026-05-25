@@ -12,15 +12,27 @@ from robocasa.utils.env_utils import convert_action
 
 
 class RobomimicImageWrapper(gym.Env):
-    def __init__(self, 
+    def __init__(self,
         env: EnvRobosuite,
         shape_meta: dict,
         init_state: Optional[np.ndarray]=None,
         render_obs_key='agentview_image',
+        render_width=None,
+        render_height=None,
+        render_camera=None,
         ):
 
         self.env = env
         self.render_obs_key = render_obs_key
+        # When render_width/height are set, render() does a fresh high-res frame
+        # straight from the MuJoCo sim instead of returning the (low-res) policy
+        # observation image. render_camera picks the camera; defaults to the one
+        # matching render_obs_key (e.g. robot0_agentview_right_image -> robot0_agentview_right).
+        self.render_width = render_width
+        self.render_height = render_height
+        if render_camera is None and render_obs_key is not None:
+            render_camera = render_obs_key[:-len('_image')] if render_obs_key.endswith('_image') else render_obs_key
+        self.render_camera = render_camera
         self.init_state = init_state
         self.seed_state_map = dict()
         self._seed = None
@@ -134,7 +146,16 @@ class RobomimicImageWrapper(gym.Env):
         # else:
         #     # random reset
         #     raw_obs = self.env.reset()
-        raw_obs, info = self.env.reset()
+        # Per-rollout env seeding: when a seed is set, pass it into the env reset
+        # so the kitchen scene (layout/style/object placement) is a deterministic
+        # function of this seed. RoboCasaGymEnv.reset(seed=...) reseeds only the
+        # env's numpy Generator (self.env.rng) -- it does NOT touch torch, so the
+        # policy's denoising noise (torch.randn) still varies run-to-run. Net:
+        # same env conditions across runs, distinct outcomes.
+        if self._seed is not None:
+            raw_obs, info = self.env.reset(seed=self._seed)
+        else:
+            raw_obs, info = self.env.reset()
         self.lang = raw_obs["annotation.human.task_description"]
         self.lang_emb = self.lang_encoder.get_lang_emb(self.lang).numpy()
 
@@ -149,6 +170,22 @@ class RobomimicImageWrapper(gym.Env):
         return obs, reward, done, info
     
     def render(self, mode='rgb_array'):
+        # High-res path: render a fresh frame from the MuJoCo sim at the requested
+        # resolution. This is independent of the 256x256 policy obs, so the policy
+        # input is unchanged -- only the saved video gets the extra detail.
+        if self.render_width is not None and self.render_height is not None:
+            # self.env.unwrapped is RoboCasaGymEnv; .sim is forwarded to the inner
+            # robosuite env. Go through .unwrapped to skip gymnasium's wrapper chain
+            # (avoids the "env.sim ... is deprecated" warning).
+            img = self.env.unwrapped.sim.render(
+                width=self.render_width,
+                height=self.render_height,
+                camera_name=self.render_camera,
+            )
+            # MuJoCo's read_pixels returns the frame bottom-up; robosuite's obs
+            # pipeline flips it with [::-1], so do the same here to stay upright.
+            return np.ascontiguousarray(img[::-1].astype(np.uint8))
+
         if self.render_cache is None:
             raise RuntimeError('Must run reset or step before render.')
         img = np.moveaxis(self.render_cache, 0, -1)

@@ -8,6 +8,7 @@ if __name__ == "__main__":
     os.chdir(ROOT_DIR)
 
 import os
+import math
 import hydra
 import torch
 from omegaconf import OmegaConf
@@ -42,6 +43,36 @@ logging.getLogger("wandb").setLevel(logging.ERROR)
 
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
+
+
+class InfiniteRandomSampler(torch.utils.data.Sampler):
+    """Yields shuffled dataset indices forever, reshuffling on every pass.
+
+    Used so the training DataLoader's iterator is created exactly once and never
+    raises StopIteration. With a fixed number of steps per "epoch"
+    (max_train_steps) that exceeds the number of batches in the data, the naive
+    approach recreates the iterator whenever it exhausts. Even with
+    persistent_workers=True (workers are not respawned) that recreation drains
+    every worker's prefetch queue, so the next batch only arrives once the cold
+    pipeline refills -- a multi-minute stall, ~9x per epoch here. An infinite
+    sampler keeps the workers prefetching continuously instead.
+
+    The order is deterministic given `seed` and identical across distributed
+    processes, which Accelerate's split_batches=True requires: every process
+    slices the same global batch, so they must agree on index order.
+    """
+
+    def __init__(self, data_source, seed=0):
+        self.num_samples = len(data_source)
+        self.seed = seed
+
+    def __iter__(self):
+        g = torch.Generator()
+        pass_idx = 0
+        while True:
+            g.manual_seed(self.seed + pass_idx)
+            yield from torch.randperm(self.num_samples, generator=g).tolist()
+            pass_idx += 1
 
 class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
     include_keys = ['global_step', 'epoch']
@@ -78,27 +109,6 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
 
         if cfg.training.debug:
             cfg.logging.project = "debug"
-        
-        wandb_cfg = OmegaConf.to_container(cfg.logging, resolve=True)
-
-        wandb_cfg.pop('project')
-
-        accelerator.init_trackers(
-            project_name=cfg.logging.project,
-            config=OmegaConf.to_container(cfg, resolve=True),
-            init_kwargs={"wandb": wandb_cfg}
-        )
-
-        # wandb_run = wandb.init(
-        #     dir=str(self.output_dir),
-        #     config=OmegaConf.to_container(cfg, resolve=True),
-        #     **cfg.logging
-        # )
-        # wandb.config.update(
-        #     {
-        #         "output_dir": self.output_dir,
-        #     }
-        # )
 
         if accelerator.is_main_process:
             data_to_share = self.output_dir
@@ -109,11 +119,30 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
         self._output_dir = data_list[0]
 
         # resume training
+        # Decide whether we are actually resuming from a checkpoint *before*
+        # starting the wandb run. Otherwise wandb resumes the previous run (and
+        # its step counter) while global_step resets to 0 because no checkpoint
+        # had been saved yet -> every log lands below the current wandb step and
+        # is silently dropped.
+        resumed_from_ckpt = False
         if cfg.training.resume:
             lastest_ckpt_path = self.get_checkpoint_path()
             if lastest_ckpt_path.is_file():
                 accelerator.print(f"Resuming from checkpoint {lastest_ckpt_path}")
                 self.load_checkpoint(path=lastest_ckpt_path)
+                resumed_from_ckpt = True
+
+        wandb_cfg = OmegaConf.to_container(cfg.logging, resolve=True)
+        wandb_cfg.pop('project')
+        # Only resume the wandb run if we actually restored a checkpoint, so the
+        # wandb step pointer and global_step stay in sync.
+        wandb_cfg['resume'] = 'allow' if resumed_from_ckpt else 'never'
+
+        accelerator.init_trackers(
+            project_name=cfg.logging.project,
+            config=OmegaConf.to_container(cfg, resolve=True),
+            init_kwargs={"wandb": wandb_cfg}
+        )
         
         if "ckpt_path" in cfg.task and cfg.task.ckpt_path is not None:
             accelerator.print(f"Initializing from checkpoint {cfg.task.ckpt_path}")
@@ -128,12 +157,26 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
         assert isinstance(dataset, BaseImageDataset)
 
         dataloader_cfg = copy.deepcopy(OmegaConf.to_container(cfg.dataloader))
+        custom_sampler = None
         if hasattr(dataset, "get_dataset_sampler"):
-            sampler = dataset.get_dataset_sampler()
-            if sampler is not None:
-                dataloader_cfg["sampler"] = sampler
-                dataloader_cfg["shuffle"] = False
-                print("using custom dataloader sampler")
+            custom_sampler = dataset.get_dataset_sampler()
+        if custom_sampler is not None:
+            dataloader_cfg["sampler"] = custom_sampler
+            dataloader_cfg["shuffle"] = False
+            print("using custom dataloader sampler")
+        else:
+            # Infinite sampler so the train iterator is created once and never
+            # exhausts -> workers keep prefetching, no per-epoch pipeline stall.
+            # max_train_steps (not the dataset size) defines the epoch length.
+            dataloader_cfg["sampler"] = InfiniteRandomSampler(
+                dataset, seed=cfg.training.seed)
+            dataloader_cfg["shuffle"] = False
+            # The infinite sampler has no len(), so the training loop drives epoch
+            # length from max_train_steps. If unset, default it to one full pass
+            # over the dataset (preserves the original "len(dataloader)" semantics).
+            if cfg.training.max_train_steps is None:
+                batch_size = dataloader_cfg["batch_size"]
+                cfg.training.max_train_steps = math.ceil(len(dataset) / batch_size)
         train_dataloader = DataLoader(dataset, **dataloader_cfg)
         normalizer_path = os.path.join(self.output_dir, 'normalizer.pkl')
         if accelerator.is_main_process:
@@ -206,8 +249,10 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
         train_dataloader, val_dataloader, self.model, self.optimizer, lr_scheduler = accelerator.prepare(
             train_dataloader, val_dataloader, self.model, self.optimizer, lr_scheduler
         )
+        # Created once for all of training; the infinite sampler means this is
+        # never re-iter()'d, so the worker prefetch pipeline never goes cold.
         train_dataloader_iter = iter(train_dataloader)
-        print("dataloader length:", len(train_dataloader))
+        print("steps per epoch (max_train_steps):", cfg.training.max_train_steps)
         print("dataset length:", len(dataset))
         device = self.model.device
         if self.ema_model is not None:
@@ -246,15 +291,8 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
 
                 assert cfg.training.max_train_steps is not None
                 for batch_idx in tqdm.tqdm(range(cfg.training.max_train_steps), desc=f"Training epoch {self.epoch}", leave=False, mininterval=cfg.training.tqdm_interval_sec):
-                    try:
-                        batch = next(train_dataloader_iter)
-                    except StopIteration:
-                        # reset for next dataset pass
-                        t1 = time.time()
-                        print("Creating new train dataloader iterator")
-                        train_dataloader_iter = iter(train_dataloader)
-                        batch = next(train_dataloader_iter)
-                        print(f"Done after {time.time() - t1} seconds.")
+                    # Infinite sampler -> never StopIteration; no iterator reset.
+                    batch = next(train_dataloader_iter)
                     # device transfer
                     batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
                     if train_sampling_batch is None:
@@ -286,7 +324,7 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                         'lr': lr_scheduler.get_last_lr()[0]
                     }
 
-                    is_last_batch = (batch_idx == (len(train_dataloader)-1))
+                    is_last_batch = (batch_idx == (cfg.training.max_train_steps-1))
                     if not is_last_batch:
                         # log of last step is combined with validation and rollout
                         accelerator.log(step_log, step=self.global_step)
@@ -328,23 +366,30 @@ class TrainDiffusionTransformerHybridWorkspace(BaseWorkspace):
                         
                         accelerator.wait_for_everyone()
 
-                # run validation
-                # if (self.epoch % cfg.training.val_every) == 0:
-                #     with torch.no_grad():
-                #         val_losses = list()
-                #         with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
-                #                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
-                #             for batch_idx, batch in enumerate(tepoch):
-                #                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                #                 loss = self.model.compute_loss(batch)
-                #                 val_losses.append(loss)
-                #                 if (cfg.training.max_val_steps is not None) \
-                #                     and batch_idx >= (cfg.training.max_val_steps-1):
-                #                     break
-                #         if len(val_losses) > 0:
-                #             val_loss = torch.mean(torch.tensor(val_losses)).item()
-                #             # log epoch average validation loss
-                #             step_log['val_loss'] = val_loss
+                # run validation on the held-out trajectories (val_ratio split)
+                if (self.epoch % cfg.training.val_every) == 0 and len(val_dataloader) > 0:
+                    # DDP wrapper doesn't expose compute_loss; use the unwrapped module
+                    val_model = accelerator.unwrap_model(self.model)
+                    was_training = val_model.training
+                    val_model.eval()
+                    with torch.no_grad():
+                        val_losses = list()
+                        for batch_idx, batch in enumerate(tqdm.tqdm(val_dataloader,
+                                desc=f"Validation epoch {self.epoch}",
+                                leave=False, mininterval=cfg.training.tqdm_interval_sec)):
+                            batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+                            loss = val_model.compute_loss(batch)
+                            val_losses.append(loss)
+                            if (cfg.training.max_val_steps is not None) \
+                                and batch_idx >= (cfg.training.max_val_steps-1):
+                                break
+                        if len(val_losses) > 0:
+                            val_loss = torch.mean(torch.stack(val_losses))
+                            # average across processes so all ranks log the same value
+                            val_loss = accelerator.reduce(val_loss, reduction="mean")
+                            step_log['val_loss'] = val_loss.item()
+                    if was_training:
+                        val_model.train()
 
                 # run diffusion sampling on a training batch
                 if (self.epoch % cfg.training.sample_every) == 0:

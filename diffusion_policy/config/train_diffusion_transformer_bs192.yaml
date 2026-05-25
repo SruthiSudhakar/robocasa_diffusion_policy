@@ -68,15 +68,14 @@ dataloader:
   num_workers: 64
   shuffle: True
   pin_memory: True
-  persistent_workers: False
-  # persistent_workers: True # set it to True based on recommendation from perplexity online
+  persistent_workers: True
 
 val_dataloader:
   batch_size: 192
   num_workers: 64
   shuffle: False
   pin_memory: True
-  persistent_workers: False
+  persistent_workers: True
 
 optimizer:
   transformer_weight_decay: 1.0e-3

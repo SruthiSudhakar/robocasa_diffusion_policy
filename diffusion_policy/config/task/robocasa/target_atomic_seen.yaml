@@ -76,7 +76,11 @@ env_runner:
 dataset:
   _target_: diffusion_policy.dataset.lerobot_dataset.LerobotCotrainingDataset
   shape_meta: *shape_meta
-  dataset_soup: posttrain_atomic_seen
+  dataset_soup: target_atomic_seen   # renamed from posttrain_atomic_seen in current robocasa
+  # Load re-encoded all-intra (GOP=1) videos for ~5x faster data loading.
+  # Build them with: python scripts/reencode_allintra.py --soup target_atomic_seen
+  # Set to "" to fall back to the original videos (opencv decode).
+  lerobot_dir_suffix: _allintra
   horizon: ${horizon}
   pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
   pad_after: ${eval:'${n_action_steps}-1'}

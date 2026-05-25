@@ -65,12 +65,13 @@ def stack_last_n_obs(all_obs, n_steps):
 
 
 class MultiStepWrapper(gym.Wrapper):
-    def __init__(self, 
-            env, 
-            n_obs_steps, 
-            n_action_steps, 
+    def __init__(self,
+            env,
+            n_obs_steps,
+            n_action_steps,
             max_episode_steps=None,
-            reward_agg_method='max'
+            reward_agg_method='max',
+            terminate_on_success=True
         ):
         super().__init__(env)
         self._action_space = repeated_space(env.action_space, n_action_steps)
@@ -80,12 +81,17 @@ class MultiStepWrapper(gym.Wrapper):
         self.n_action_steps = n_action_steps
         self.reward_agg_method = reward_agg_method
         self.n_obs_steps = n_obs_steps
+        # End the episode (and thus stop recording video frames) the moment the
+        # task is reported successful, instead of running out the step budget.
+        self.terminate_on_success = terminate_on_success
 
         self.obs = deque(maxlen=n_obs_steps+1)
         self.reward = list()
         self.done = list()
         self.info = defaultdict(lambda : deque(maxlen=n_obs_steps+1))
-    
+        # 1-indexed env step at which success was first observed (None if never).
+        self.success_step = None
+
     def reset(self):
         """Resets the environment using kwargs."""
         obs = super().reset()
@@ -94,6 +100,7 @@ class MultiStepWrapper(gym.Wrapper):
         self.reward = list()
         self.done = list()
         self.info = defaultdict(lambda : deque(maxlen=self.n_obs_steps+1))
+        self.success_step = None
 
         obs = self._get_obs(self.n_obs_steps)
         return obs
@@ -110,9 +117,16 @@ class MultiStepWrapper(gym.Wrapper):
 
             self.obs.append(observation)
             self.reward.append(reward)
+            # record the (1-indexed) env step of the first success in this episode
+            if self.success_step is None and bool(np.all(info.get("success", False))):
+                self.success_step = len(self.reward)
             if (self.max_episode_steps is not None) \
                 and (len(self.reward) >= self.max_episode_steps):
                 # truncation
+                done = True
+            # terminate as soon as the task succeeds so the env stops stepping
+            # (and VideoRecordingWrapper stops writing frames) for this rollout
+            if self.terminate_on_success and (self.success_step is not None):
                 done = True
             self.done.append(done)
             self._add_info(info)

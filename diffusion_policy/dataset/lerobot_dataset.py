@@ -26,6 +26,7 @@ from robomimic.macros import LANG_EMB_KEY
 
 import torch.utils.data
 import torch
+import av
 from typing import Dict, List
 
 
@@ -34,6 +35,53 @@ from robocasa.utils.dataset_registry import DATASET_SOUP_REGISTRY
 
 from robocasa.utils.groot_utils.groot_dataset import LeRobotSingleDataset, LE_ROBOT_MODALITY_FILENAME, ModalityConfig, LE_ROBOT_EPISODE_FILENAME, LeRobotMixtureDataset
 import pathlib
+
+def _pyav_frames_by_timestamps(video_path: str, timestamps, num_frames_hint=None) -> np.ndarray:
+    """Fast, correct replacement for groot's opencv frame reader.
+
+    The default backend (groot_video_utils.get_frames_by_timestamps,
+    video_backend="opencv") opens a fresh cv2.VideoCapture per call and uses
+    CAP_PROP_POS_FRAMES, which costs ~50 ms/frame and is the dominant training
+    bottleneck (data loading, not GPU). This uses a pyav keyframe seek instead.
+
+    Frame *selection* is identical to the opencv branch -- for each requested
+    timestamp we pick the frame whose index/fps is nearest -- so output is
+    pixel-for-pixel equal. It then seeks to the keyframe at/<= that frame and
+    decodes forward to it. On all-intra video (GOP=1, every frame a keyframe;
+    see scripts/reencode_allintra.py) the forward decode is a single frame
+    (~6 ms/frame, ~9x faster). On normal video it still returns the correct
+    frame, just slower -- so this is a safe drop-in even before re-encoding.
+    """
+    timestamps = np.asarray(timestamps, dtype=np.float64)
+    container = av.open(video_path)
+    try:
+        stream = container.streams.video[0]
+        # single-threaded decode: DataLoader already parallelises across workers,
+        # and per-decoder threads would oversubscribe (the >4-workers stall).
+        stream.thread_type = "NONE"
+        fps = float(stream.average_rate)
+        num_frames = stream.frames or num_frames_hint
+        assert num_frames, f"could not determine frame count for {video_path}"
+        frame_ts = np.arange(num_frames) / fps
+        indices = np.abs(frame_ts[:, None] - timestamps[None, :]).argmin(axis=0)
+        tb = stream.time_base
+        start = stream.start_time or 0
+        out = []
+        for idx in indices:
+            target = int(round(idx / fps / tb)) + start
+            container.seek(target, stream=stream, backward=True, any_frame=False)
+            frame_img = None
+            for frame in container.decode(stream):
+                fidx = int(round((frame.pts - start) * tb * fps))
+                frame_img = frame.to_ndarray(format="rgb24")
+                if fidx >= idx:
+                    break
+            assert frame_img is not None, f"no frame decoded for index {idx} in {video_path}"
+            out.append(frame_img)
+    finally:
+        container.close()
+    return np.stack(out, axis=0)
+
 
 def get_modality_keys(dataset_path: pathlib.Path) -> dict[str, list[str]]:
     """
@@ -70,9 +118,14 @@ class LerobotDataset(LeRobotSingleDataset, BaseImageDataset):
             val_ratio=0.0,
             lang_encoder=None,
             del_lang_encoder_after_init=True,
+            use_pyav_decode=False,
         ):
 
         assert n_obs_steps and n_obs_steps > 0
+        # pyav decode is ~9x faster than opencv ONLY on all-intra (GOP=1) video;
+        # on normal video it forward-decodes the whole GOP and is ~6x SLOWER.
+        # So only enable it when pointed at re-encoded data (see reencode_allintra.py).
+        self.use_pyav_decode = use_pyav_decode
         self.abs_action = abs_action
         assert not self.abs_action, "abs_action is not supported in LerobotDataset"
         dataset_path = pathlib.Path(dataset_path)
@@ -134,9 +187,38 @@ class LerobotDataset(LeRobotSingleDataset, BaseImageDataset):
         self.lerobot_action_keys = self.action_info['lerobot_keys']
         self.action_size = self.action_info['shape'][0]
     
+    def get_video(self, trajectory_id: int, key: str, base_index: int) -> np.ndarray:
+        # Override LeRobotSingleDataset.get_video (opencv backend) with the pyav
+        # reader; same frame selection, ~9x faster on all-intra video. Index/clamp
+        # logic mirrors the parent so output is identical.
+        if not self.use_pyav_decode:
+            # original opencv path -- correct (and faster) on normal-GOP video
+            return super().get_video(trajectory_id, key, base_index)
+        step_indices = self.delta_indices[key] + base_index
+        trajectory_index = self.get_trajectory_index(trajectory_id)
+        step_indices = np.maximum(step_indices, 0)
+        step_indices = np.minimum(
+            step_indices, self.trajectory_lengths[trajectory_index] - 1
+        )
+        assert key.startswith("video."), f"Video key must start with 'video.', got {key}"
+        subkey = key.replace("video.", "")
+        video_path = self.get_video_path(trajectory_id, subkey)
+        assert self.curr_traj_data is not None, f"No data found for {trajectory_id=}"
+        timestamp = self.curr_traj_data["timestamp"].to_numpy()
+        video_timestamp = timestamp[step_indices]
+        return _pyav_frames_by_timestamps(
+            video_path.as_posix(),
+            video_timestamp,
+            num_frames_hint=int(self.trajectory_lengths[trajectory_index]),
+        )
+
     def _get_lang_embeddings(self):
         episode_path = self.dataset_path / LE_ROBOT_EPISODE_FILENAME
-        device = TorchUtils.get_torch_device(try_to_use_cuda=True)
+        # CPU on purpose: this encoder runs once at init to precompute embeddings
+        # (stored as numpy, never used on GPU again). Creating a CUDA context here,
+        # before the DataLoader forks its workers, deadlocks multi-GPU training
+        # (fork-after-CUDA-init) and piles every rank's CLIP onto cuda:0.
+        device = torch.device("cpu")
         if self._lang_encoder is None:
             self._lang_encoder = LangUtils.LangEncoder(
                     device=device,
@@ -281,9 +363,10 @@ class LerobotCotrainingDataset(LeRobotMixtureDataset, BaseImageDataset):
             val_ratio=0.0, # validation not implemented yet,
             ds_weights=None,
             ds_weights_alpha=0.40,
+            lerobot_dir_suffix="",  # e.g. "_allintra" to load re-encoded videos
             metadata_config: dict = {
             "percentile_mixing_method": "weighted_average",
-        } 
+        }
         ):
         # exactly one of dataset_paths or dataset_soup must be defined
         assert (dataset_paths == None) + (dataset_soup == None) == 1
@@ -301,11 +384,25 @@ class LerobotCotrainingDataset(LeRobotMixtureDataset, BaseImageDataset):
             if not os.path.isabs(ds_path):
                 # hack: fill in robocasa base dataset path
                 from robocasa.macros import DATASET_BASE_PATH
-                dataset_soup_list[i]["path"] = os.path.join(DATASET_BASE_PATH, ds_path)
-            
+                ds_path = os.path.join(DATASET_BASE_PATH, ds_path)
+
+            # Redirect to a re-encoded (all-intra) sibling dir if requested, e.g.
+            # ".../CloseBlenderLid/.../lerobot" -> ".../lerobot_allintra".
+            if lerobot_dir_suffix:
+                base = ds_path.rstrip("/")
+                candidate = base + lerobot_dir_suffix
+                assert os.path.isdir(candidate), (
+                    f"lerobot_dir_suffix={lerobot_dir_suffix!r} but {candidate} "
+                    f"does not exist; run scripts/reencode_allintra.py first."
+                )
+                ds_path = candidate
+            dataset_soup_list[i]["path"] = ds_path
+
             dataset_soup_list[i]["ds_weight"] = dataset_soup_list[i].get("ds_weight", None)
 
-        device = TorchUtils.get_torch_device(try_to_use_cuda=True)
+        # CPU on purpose — see note in _get_lang_embeddings: avoids the multi-GPU
+        # fork-after-CUDA-init deadlock and keeps CLIP off cuda:0 for every rank.
+        device = torch.device("cpu")
         lang_encoder = LangUtils.LangEncoder(device=device)
         datasets = [
             LerobotDataset(
@@ -324,6 +421,8 @@ class LerobotCotrainingDataset(LeRobotMixtureDataset, BaseImageDataset):
                 val_ratio=val_ratio,
                 lang_encoder=lang_encoder,
                 del_lang_encoder_after_init=False,
+                # fast pyav decode only when pointed at re-encoded all-intra video
+                use_pyav_decode=bool(lerobot_dir_suffix),
             ) for ds_meta in dataset_soup_list
         ]
         del lang_encoder
@@ -361,7 +460,61 @@ class LerobotCotrainingDataset(LeRobotMixtureDataset, BaseImageDataset):
         self.action_info = self.shape_meta['action']
         self.lerobot_action_keys = self.action_info['lerobot_keys']
         self.action_size = self.action_info['shape'][0]
-    
+
+        # ----- held-out validation split (whole trajectories) -----
+        # The mixture samples trajectories via self._trajectory_sampling_weights
+        # (set by LeRobotMixtureDataset.__init__ above). We hold out a fraction of
+        # trajectories per dataset by zeroing their sampling weight for training,
+        # and keep the complementary weights for the validation view. Splitting at
+        # the trajectory level avoids train/val leakage from overlapping windows.
+        self._length_override = None
+        split_rng = np.random.default_rng(seed)
+        train_traj_weights = []
+        val_traj_weights = []
+        self._val_num_steps = 0
+        self._train_num_steps = 0
+        for ds_idx, ds in enumerate(self.datasets):
+            n_traj = len(ds.trajectory_ids)
+            base_w = np.asarray(self._trajectory_sampling_weights[ds_idx], dtype=np.float64).copy()
+            # number of val trajectories; always leave >=1 for training
+            n_val = int(round(val_ratio * n_traj)) if val_ratio and val_ratio > 0 else 0
+            n_val = min(n_val, max(0, n_traj - 1))
+            perm = split_rng.permutation(n_traj)
+            val_idx = perm[:n_val]
+            train_idx = perm[n_val:]
+            val_mask = np.zeros(n_traj, dtype=bool)
+            val_mask[val_idx] = True
+
+            tw = base_w.copy()
+            tw[val_mask] = 0.0
+            if tw.sum() > 0:
+                tw = tw / tw.sum()
+            train_traj_weights.append(tw)
+
+            vw = base_w.copy()
+            vw[~val_mask] = 0.0
+            if vw.sum() > 0:
+                vw = vw / vw.sum()
+            val_traj_weights.append(vw)
+
+            self._val_num_steps += int(np.asarray(ds.trajectory_lengths)[val_idx].sum())
+            self._train_num_steps += int(np.asarray(ds.trajectory_lengths)[train_idx].sum())
+
+        # this (training) instance only samples train trajectories
+        self._trajectory_sampling_weights = train_traj_weights
+        # stash val weights so get_validation_dataset() can build the val view
+        self._val_traj_weights = val_traj_weights
+
+    def get_validation_dataset(self):
+        # Shallow copy: shares the underlying per-task datasets, metadata and
+        # language-embedding caches, but samples only the held-out trajectories
+        # deterministically (mode="val" makes sample_step seed on the index alone).
+        val_set = copy.copy(self)
+        val_set.mode = "val"
+        val_set._trajectory_sampling_weights = self._val_traj_weights
+        val_set._length_override = int(self._val_num_steps)
+        return val_set
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         dataset, trajectory_name, step = self.sample_step(idx)
         global_ds_index = self.to_global_index(dataset, trajectory_name, step)
@@ -377,6 +530,8 @@ class LerobotCotrainingDataset(LeRobotMixtureDataset, BaseImageDataset):
         return g_idx
     
     def __len__(self):
+        if getattr(self, "_length_override", None) is not None:
+            return self._length_override
         return np.sum(self.dataset_lengths)
 
     def get_normalizer(self, **kwargs) -> LinearNormalizer:
