@@ -21,6 +21,7 @@ Point training at the result by setting in the task's dataset config:
 Usage:
     python scripts/reencode_allintra.py --soup target_atomic_seen --only-first   # validate one
     python scripts/reencode_allintra.py --soup target_atomic_seen                 # all
+    python scripts/reencode_allintra.py --dataset-paths /abs/.../lerobot ...      # explicit dirs
 """
 import argparse
 import os
@@ -90,14 +91,22 @@ def reencode(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--soup", required=True)
+    ap.add_argument("--soup", help="registered dataset soup name to resolve to dirs")
+    ap.add_argument("--dataset-paths", nargs="+",
+                    help="explicit .../lerobot dirs (alternative to --soup)")
     ap.add_argument("--only-first", action="store_true",
                     help="process only the first dataset dir (for validation)")
     ap.add_argument("--workers", type=int, default=min(64, os.cpu_count() or 8))
     ap.add_argument("--crf", type=int, default=18)
     args = ap.parse_args()
 
-    src_dirs = resolve_soup_dirs(args.soup)
+    if (args.soup is None) == (args.dataset_paths is None):
+        ap.error("provide exactly one of --soup or --dataset-paths")
+
+    if args.dataset_paths is not None:
+        src_dirs = [p.rstrip("/") for p in args.dataset_paths]
+    else:
+        src_dirs = resolve_soup_dirs(args.soup)
     if args.only_first:
         src_dirs = src_dirs[:1]
 

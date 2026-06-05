@@ -165,9 +165,8 @@ HYDRA_FULL_ERROR=1 python train.py \
 # ============================================================================
 # Section 5 — Full train (multi-day on a single A100; dedicated Claude instance)
 # ============================================================================
-
-cd /proj/vondrick3/sruthi/Appaji/robocasa_diffusion_policy
-conda activate robocasa_dp
+Convert data:
+python scripts/reencode_allintra.py --dataset-paths
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
 OPENCV_FFMPEG_CAPTURE_OPTIONS="threads;1" \
@@ -182,32 +181,51 @@ HYDRA_FULL_ERROR=1 accelerate launch --multi_gpu --num_processes 8 --mixed_preci
     training.val_every=20 \
     training.sample_every=20
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
-OPENCV_FFMPEG_CAPTURE_OPTIONS="threads;1" \
-HYDRA_FULL_ERROR=1 accelerate launch --multi_gpu --num_processes 8 --mixed_precision bf16 \
-    train.py \
-    --config-name=train_diffusion_unet_hybrid_workspace \
-    task=robocasa/target_atomic_seen \
-    logging.project=diffusion_policy_robocasa_atomic_seen \
-    'hydra.run.dir=data/jgd/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}_jgd_alltasks' \
-    training.checkpoint_every=10 \
-    training.val_every=10 \
-    training.sample_every=10
-
 # ============================================================================
 # Section 6 — Evaluate + render (needs a trained checkpoint from Section 5)
 # ============================================================================
 
-
 cd /proj/vondrick3/sruthi/Appaji/robocasa_diffusion_policy
 conda activate robocasa_dp
 
-CKPT=/proj/vondrick3/sruthi/Appaji/robocasa_diffusion_policy/data/jgd/2026.05.23/23.28.09_train_diffusion_unet_hybrid_target_atomic_seen_jgd_CloseToasterOvenDoor/checkpoints/epoch=0100-train_loss=0.0027.ckpt
-CUDA_VISIBLE_DEVICES=1 MUJOCO_GL=egl python run_diffusion_policy_robocasa.py \
-    --checkpoint "$CKPT" --task_set CloseToasterOvenDoor --split pretrain
+CKPT=/proj/vondrick3/sruthi/Appaji/robocasa_diffusion_policy/data/jgd/2026.05.26/10.38.08_train_diffusion_unet_hybrid_target_atomic_seen_jgd_PickPlaceToasterOvenToCounter/checkpoints/epoch=0075-train_loss=0.0021.ckpt
+CUDA_VISIBLE_DEVICES=2 MUJOCO_GL=egl python run_diffusion_policy_robocasa.py \
+    --checkpoint "$CKPT" --task_set PickPlaceToasterOvenToCounter --split pretrain --render_camera robot0_eye_in_hand
 
-CKPT=/proj/vondrick3/sruthi/Appaji/robocasa_diffusion_policy/data/jgd/2026.05.23/22.56.00_train_diffusion_unet_hybrid_target_atomic_seen_jgd_alltasks/checkpoints/epoch=0200-train_loss=0.0078.ckpt
+CKPT=/proj/vondrick3/sruthi/Appaji/robocasa_diffusion_policy/released_checkpoints/diffusion_policy/17.40.09_train_diffusion_transformer_hybrid_pretrain_human300/checkpoints/epoch=1400-test_mean_score=-1.000.ckpt
 CUDA_VISIBLE_DEVICES=0 MUJOCO_GL=egl python run_diffusion_policy_robocasa.py \
-    --checkpoint "$CKPT" --task_set atomic_seen --split pretrain
+--checkpoint "$CKPT" --task_set TurnOnMicrowave --split target
 
-python diffusion_policy/scripts/get_eval_stats.py --dir "$OUT"
+# ============================================================================
+# Section 7 — Evaluate + render with VLM ranking (needs a trained checkpoint from Section 5)
+# ============================================================================
+cd /proj/vondrick3/sruthi/Appaji/robocasa_diffusion_policy
+conda activate robocasa_dp
+
+RANK_DIR=/proj/vondrick3/sruthi/Appaji/rc_rank/PickPlaceCounterToDrawer
+VLM_CKPT=/proj/vondrick3/sruthi/Appaji/trl/outputs/PickPlaceCounterToDrawer_20260526_213216_robocasa/checkpoint-1000
+CKPT=/proj/vondrick3/sruthi/Appaji/robocasa_diffusion_policy/released_checkpoints/diffusion_policy/17.40.09_train_diffusion_transformer_hybrid_pretrain_human300/checkpoints/epoch=1400-test_mean_score=-1.000.ckpt
+TASK=PickPlaceCounterToDrawer
+SPLIT=pretrain
+
+CUDA_VISIBLE_DEVICES=0 MUJOCO_GL=egl python run_diffusion_policy_robocasa_vlm_ranking.py \
+--checkpoint "$CKPT" \
+--task "$TASK" \
+--split "$SPLIT" \
+--num-samples 1
+
+
+CUDA_VISIBLE_DEVICES=1 /proj/vondrick3/sruthi/miniconda3/envs/vlmoverlay/bin/python \
+    /proj/vondrick3/sruthi/Appaji/trl/examples/scripts/myscripts/rank_serve_robocasa.py \
+    --inbox_dir $RANK_DIR/inbox --done_dir $RANK_DIR/done --error_dir $RANK_DIR/error \
+    --checkpoint "$VLM_CKPT" \
+    --task_name "$TASK" \
+    --gpu_ids 0 --batch_size 10 --max_pixels 960x540
+
+CUDA_VISIBLE_DEVICES=2 MUJOCO_GL=egl python run_diffusion_policy_robocasa_vlm_ranking.py \
+--checkpoint "$CKPT" \
+--task "$TASK" \
+--split "$SPLIT" \
+--no-launch-rank-server \
+--rank-dir $RANK_DIR \
+--vlm-checkpoint $VLM_CKPT
